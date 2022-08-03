@@ -1,0 +1,123 @@
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: oci-image-artifact-registry
+  labels:
+    app.kubernetes.io/version: "0.6"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.17.0"
+    tekton.dev/categories: Image Build
+    tekton.dev/tags: image-build
+    tekton.dev/displayName: "Build and upload container image using Kaniko"
+    tekton.dev/platforms: "linux/amd64"
+spec:
+  description:
+    This Task builds a simple Dockerfile with kaniko and pushes to a registry.
+    This Task stores the image name and digest as results, allowing Tekton Chains to pick up
+    that an image from structured results & sign it.
+  params:
+    - name: image-source
+      description: The image to build.
+      properties:
+        name: {type: string}
+        dockerfile: {type: string}
+        context: {type: string}
+        git-source: {type: string}
+    - name: EXTRA_ARGS
+      type: array
+      default: []
+    - name: BUILDER_IMAGE
+      description: The image on which builds will run (default is v1.5.1)
+      default: gcr.io/kaniko-project/executor:v1.8.0-debug
+  workspaces:
+    - name: source
+      description: Holds the context and Dockerfile
+    - name: dockerconfig
+      description: Includes a docker `config.json`
+      optional: true
+      mountPath: /kaniko/.docker/
+  results:
+    - name: ARTIFACT_INPUTS
+      type: array
+      description: artifact input list.
+    - name: ARTIFACT_OUTPUTS
+      type: array
+      description: artifact output list.
+    - name: git-source
+      description: The image just built.
+      properties:
+        uri:
+          type: string
+        digest:
+          type: string
+    - name: image1
+      description: The image just built.
+      properties:
+        uri:
+          type: string
+        digest:
+          type: string
+  steps:
+    - name: git-clone
+      workingDir: $(workspaces.source.path)
+      image: gcr.io/tekton-releases/github.com/tektoncd/pipeline/cmd/git-init:v0.29.0
+      script: |
+        echo $(params.image-source.git-source)
+        git clone $(params.image-source.git-source)
+    - name: build-and-push
+      workingDir: $(workspaces.source.path)
+      image: $(params.BUILDER_IMAGE)
+      args:
+        - $(params.EXTRA_ARGS)
+        - --dockerfile=$(params.image-source.dockerfile)
+        - --context=$(workspaces.source.path)/$(params.image-source.context) # The user does not need to care the workspace and the source.
+        - --destination=$(params.image-source.name)
+        - --digest-file=$(workspaces.source.path)/digest
+      # kaniko assumes it is running as root, which means this example fails on platforms
+      # that default to run containers as random uid (like OpenShift). Adding this securityContext
+      # makes it explicit that it needs to run as root.
+      securityContext:
+        runAsUser: 0
+    - name: write-artifact-inputs-results
+      image: gcr.io/tekton-releases/github.com/tektoncd/pipeline/cmd/git-init:v0.21.0
+      workingDir: $(workspaces.source.path)
+      script: |
+        #!/bin/sh
+        # produce artifact inputs provenances
+        CHECKOUT_DIR="$(params.image-source.context)"
+        cd "${CHECKOUT_DIR}"
+        RESULT_SHA="$(git rev-parse HEAD)"
+        echo -n "{\"uri\":\"$(params.image-source.git-source)\", \"digest\":\"${RESULT_SHA}\"}" > $(results.git-source.path)
+        echo -n "[\"git-source\"]" | tee > $(results.ARTIFACT_INPUTS.path)
+      securityContext:
+        runAsUser: 0
+    - name: write-artifact-outputs-results
+      image: docker.io/library/bash:5.1.4@sha256:b208215a4655538be652b2769d82e576bc4d0a2bb132144c060efc5be8c3f5d6
+      workingDir: $(workspaces.source.path)
+      script: |
+        # produce artifact outputs provenances
+        set -e
+        image="$(params.image-source.name)"
+        digest="$(cat $(workspaces.source.path)/digest)"
+        echo -n "{\"uri\":\"${image}\", \"digest\":\"${digest}\"}" > $(results.image1.path)
+        echo -n "[\"image1\"]" | tee > $(results.ARTIFACT_OUTPUTS.path)
+      securityContext:
+        runAsUser: 0
+---
+apiVersion: tekton.dev/v1beta1
+kind: TaskRun
+metadata:
+  generateName: example-run-
+spec:
+  params:
+  - name: image-source
+    value:
+      name: gcr.io/yawenluo-cloud-test/self-built-git
+      dockerfile: ./cloud-builders/git/Dockerfile
+      context: ./cloud-builders/git
+      git-source: https://github.com/GoogleCloudPlatform/cloud-builders.git
+  taskRef:
+    name: oci-image-artifact-registry
+  workspaces:
+  - name: source
+    emptyDir: {}
